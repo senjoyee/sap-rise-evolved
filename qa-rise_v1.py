@@ -5,22 +5,25 @@ from langchain import hub
 from langchain.chains import create_retrieval_chain
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_chroma import Chroma
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import Docx2txtLoader
-from langchain_community.document_loaders import TextLoader
-
+from langchain.chains import create_retrieval_chain, create_history_aware_retriever
+from langchain_community.chat_message_histories import ChatMessageHistory
+from langchain_core.chat_history import BaseChatMessageHistory
+from langchain_core.runnables.history import RunnableWithMessageHistory
 from typing import List
 from langchain_core.documents import Document
 from dotenv import load_dotenv
+import uuid
 
 # Load environment variables from a .env file
 load_dotenv()
 
 # Initialize global variables
 vectorstore = None
-rag_chain = None
+conversational_rag_chain = None
 
 # New function to reset the chat
 def reset_chat():
@@ -73,7 +76,30 @@ def initialize_vectorstore():
   return vectorstore.as_retriever(k=20)
 
 def setup_rag_chain(retriever):
+  global conversational_rag_chain
   try:
+      # Initialize the language model
+      llm = ChatOpenAI(model="gpt-4o-mini")
+
+      # Contextualize question
+      contextualize_q_system_prompt = (
+          "Given a chat history and the latest user question "
+          "which might reference context in the chat history, "
+          "formulate a standalone question which can be understood "
+          "without the chat history. Do NOT answer the question, "
+          "just reformulate it if needed and otherwise return it as is."
+      )
+      contextualize_q_prompt = ChatPromptTemplate.from_messages(
+          [
+              ("system", contextualize_q_system_prompt),
+              MessagesPlaceholder("chat_history"),
+              ("human", "{input}"),
+          ]
+      )
+      history_aware_retriever = create_history_aware_retriever(
+          llm, retriever, contextualize_q_prompt
+      )
+
       # Define the system prompt for the chatbot
       system_prompt = """You are an expert assistant for question-answering tasks related to SAP and its offerings. Use the following pieces of retrieved context to answer the question. Follow these guidelines:
 
@@ -92,39 +118,56 @@ def setup_rag_chain(retriever):
                 Remember to format your answer according to the type of question asked, always using item numbers for specific SAP feature questions. When discussing SAP services or support, mention the need to open a ticket as part of the process."""
 
       # Create a chat prompt template
-      prompt = ChatPromptTemplate.from_messages(
+      qa_prompt = ChatPromptTemplate.from_messages(
           [
               ("system", system_prompt),
+              MessagesPlaceholder("chat_history"),
               ("human", "{input}"),
           ]
       )
 
-      # Initialize the language model
-      llm = ChatOpenAI(model="gpt-4o-mini")
-      
       # Create the question-answering chain
-      question_answer_chain = create_stuff_documents_chain(llm, prompt)
+      question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
       
       # Create the retrieval chain
-      rag_chain = create_retrieval_chain(retriever, question_answer_chain)
+      rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
 
       if rag_chain is None:
           raise ValueError("create_retrieval_chain returned None")
+      
+      # Statefully manage chat history
+      store = {}
 
-      # Store the RAG chain in the session state
-      st.session_state.rag_chain = rag_chain
+      def get_session_history(session_id: str) -> BaseChatMessageHistory:
+          if session_id not in store:
+              store[session_id] = ChatMessageHistory()
+          return store[session_id]
+      
+      conversational_rag_chain = RunnableWithMessageHistory(
+          rag_chain,
+          get_session_history,
+          input_messages_key="input",
+          history_messages_key="chat_history",
+          output_messages_key="answer",
+      )
+
+
+      # Store the conversational RAG chain in the session state
+      st.session_state.conversational_rag_chain = conversational_rag_chain
   except Exception as e:
       st.error(f"Error setting up RAG chain: {str(e)}")
       st.session_state.rag_chain = None
       raise
 
 def get_answer(question):
-  # Check if the RAG chain is properly initialized
-  if "rag_chain" not in st.session_state or st.session_state.rag_chain is None:
+  if "session_id" not in st.session_state:
+      st.session_state.session_id = str(uuid.uuid4())
+  # Check if the conversational RAG chain is properly initialized
+  if "conversational_rag_chain" not in st.session_state or st.session_state.conversational_rag_chain is None:
       return "Sorry, the chatbot is not properly initialized. Please try refreshing the page."
   
   # Get the response from the RAG chain
-  response = st.session_state.rag_chain.invoke({"input": question})
+  response = st.session_state.conversational_rag_chain.invoke({"input": question},config={"configurable": {"session_id": "default"}})
   return response["answer"]
 
 # Streamlit app
@@ -138,16 +181,16 @@ if "initialized" not in st.session_state:
       if retriever is not None:
           st.info("Vector store initialized successfully. Setting up RAG chain...")
           setup_rag_chain(retriever)
-          if "rag_chain" in st.session_state:
-              if st.session_state.rag_chain is not None:
+          if "conversational_rag_chain" in st.session_state:
+              if st.session_state.conversational_rag_chain is not None:
                   st.session_state.initialized = True
               else:
                   st.error(
-                      "RAG chain is None after setup. Please check the setup_rag_chain function."
+                      "Conversational RAG chain is None after setup. Please check the setup_rag_chain function."
                   )
           else:
               st.error(
-                  "rag_chain not found in session state. Please check if it's being set correctly."
+                  "Conversational rag_chain not found in session state. Please check if it's being set correctly."
               )
       else:
           st.error("Failed to initialize vector store")
@@ -160,6 +203,9 @@ if "chat_open" not in st.session_state:
 # Chat interface
 if "messages" not in st.session_state:
   st.session_state.messages = []
+
+if "chat_history" not in st.session_state:
+  st.session_state.chat_history = ChatMessageHistory()
 
 # Add buttons for closing and resetting the chat
 col1, col2 = st.columns(2)
