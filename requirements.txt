@@ -1,0 +1,12 @@
+langgraph
+langchain-openai
+pandas
+python-dotenv
+openpyxl
+black
+langchain-groq
+langchain-chroma
+langchain-community
+streamlit
+docx2txt
+black
